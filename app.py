@@ -1,19 +1,19 @@
 import streamlit as st
 import geopandas as gpd
 import ezdxf
+from ezdxf import zoom
 import fiona
 import osmnx as ox
 import folium
 import tempfile
 import os
 from streamlit_folium import folium_static
-from shapely.ops import transform
 
-# Set Page Config
-st.set_page_config(page_title="KML to CAD Pro v2", layout="wide")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="KML to DXF Pro: Auto-Fit", layout="wide")
 
 def load_kml_properly(path):
-    """Reads all KML layers and returns a GeoDataFrame in WGS84."""
+    """Recursively reads all KML layers and filters for Points and Lines."""
     layers = fiona.listlayers(path)
     gdfs = []
     for layer in layers:
@@ -21,79 +21,96 @@ def load_kml_properly(path):
             tmp_gdf = gpd.read_file(path, layer=layer, driver='KML')
             if not tmp_gdf.empty:
                 gdfs.append(tmp_gdf)
-        except:
+        except Exception:
             continue
     if gdfs:
         full_gdf = gpd.pd.concat(gdfs, ignore_index=True)
-        # Filter only Point and LineString
+        # Filter: Ignore Polygons to keep the CAD file clean
         return full_gdf[full_gdf.geometry.type.isin(['Point', 'LineString'])]
     return gpd.GeoDataFrame()
 
-def convert_to_dxf_final(gdf_wgs84):
+def convert_to_dxf_full(gdf_wgs84):
     """
-    Converts WGS84 GDF to a Projected DXF (UTM).
-    This ensures 1 unit in CAD = 1 Meter.
+    1. Converts coordinates from Degrees to Meters (UTM).
+    2. Adds OSM road background.
+    3. Sets DXF metadata for 'Auto-Fit' on open.
     """
-    # 1. Project to UTM automatically based on centroid
-    utm_gdf = gdf_wgs84.estimate_utm_crs()
-    gdf_projected = gdf_wgs84.to_crs(utm_gdf)
+    # 1. Coordinate Transformation
+    # Automatically finds the correct UTM zone (e.g., UTM 48S for Jakarta/Java)
+    utm_crs = gdf_wgs84.estimate_utm_crs()
+    gdf_projected = gdf_wgs84.to_crs(utm_crs)
     
+    # 2. DXF Initialization (R2010 for high compatibility)
     doc = ezdxf.new('R2010')
+    
+    # CRITICAL: Set units to Meters (value 6) so AutoCAD doesn't treat it as mm
+    doc.header['$INSUNITS'] = 6 
+    
     msp = doc.modelspace()
     
-    # Setup Layers with Standard CAD Colors
-    layers = {
-        'MAP_JALAN': 8,       # Grey
-        'KABEL_JARINGAN': 3,  # Green
-        'PERANGKAT_TITIK': 1, # Red
-        'LABEL_TEKS': 7       # White/Black
+    # 3. Create Layers with Standard Colors
+    layers_config = {
+        '01_ROAD_OSM': 8,      # Grey
+        '02_KML_LINE': 3,      # Green
+        '03_KML_POINT': 1,     # Red
+        '04_LABELS': 7         # White/Black
     }
-    for name, color in layers.items():
+    for name, color in layers_config.items():
         doc.layers.new(name=name, dxfattribs={'color': color})
 
-    # 2. Fetch OSM Roads using Bounding Box (More robust than Point)
+    # 4. Fetch OSM Roads (Background)
     try:
-        with st.spinner("Fetching road vectors..."):
-            bounds = gdf_wgs84.total_bounds # [minx, miny, maxx, maxy]
-            # Buffer the bounds slightly
-            streets = ox.graph_from_bbox(bounds[3]+0.002, bounds[1]-0.002, 
-                                        bounds[2]+0.002, bounds[0]-0.002, 
-                                        network_type='drive')
+        with st.spinner("Fetching surrounding roads..."):
+            bounds = gdf_wgs84.total_bounds # [min_x, min_y, max_x, max_y]
+            # Fetch roads within a small buffer of the KML area
+            streets = ox.graph_from_bbox(
+                bounds[3]+0.005, bounds[1]-0.005, 
+                bounds[2]+0.005, bounds[0]-0.005, 
+                network_type='drive'
+            )
             _, edges = ox.graph_to_gdfs(streets)
-            edges_projected = edges.to_crs(utm_gdf)
-            
-            for _, edge in edges_projected.iterrows():
+            edges_utm = edges.to_crs(utm_crs)
+            for _, edge in edges_utm.iterrows():
                 if edge.geometry.geom_type == 'LineString':
-                    msp.add_lwpolyline(list(edge.geometry.coords), dxfattribs={'layer': 'MAP_JALAN'})
+                    msp.add_lwpolyline(list(edge.geometry.coords), dxfattribs={'layer': '01_ROAD_OSM'})
     except Exception as e:
-        st.sidebar.warning(f"OSM Roads skipped: {e}")
+        st.sidebar.warning(f"OSM Road background skipped: {e}")
 
-    # 3. Plot KML Data in Meters
+    # 5. Draw KML Entities (Projected in Meters)
     for _, row in gdf_projected.iterrows():
         geom = row.geometry
         name = str(row.get('Name', ''))
         
         if geom.geom_type == 'Point':
-            # In UTM, radius is in meters. 0.5 = 50cm circle
-            msp.add_circle((geom.x, geom.y), radius=0.5, dxfattribs={'layer': 'PERANGKAT_TITIK'})
+            # Drawing a 1-meter radius circle
+            msp.add_circle((geom.x, geom.y), radius=1.0, dxfattribs={'layer': '03_KML_POINT'})
             if name and name.lower() != 'none':
-                # Text height 1.5 meters for readability
-                msp.add_text(name, dxfattribs={'layer': 'LABEL_TEKS', 'height': 1.2}).set_placement((geom.x + 1, geom.y + 1))
+                # Text height of 1.5 meters for clear visibility
+                msp.add_text(name, dxfattribs={'layer': '04_LABELS', 'height': 1.5}).set_placement((geom.x + 1.2, geom.y))
         
         elif geom.geom_type == 'LineString':
-            msp.add_lwpolyline(list(geom.coords), dxfattribs={'layer': 'KABEL_JARINGAN'})
-            
+            msp.add_lwpolyline(list(geom.coords), dxfattribs={'layer': '02_KML_LINE'})
+
+    # 6. AUTO-FIT: Calculate extents and set the camera
+    zoom.extents(msp)
+    
+    # Save to a temporary file
     tmp_path = tempfile.mktemp(suffix='.dxf')
     doc.saveas(tmp_path)
     return tmp_path
 
-# --- UI ---
-st.title("📐 Professional KML to DXF Converter")
-st.info("This version automatically converts coordinates to **Meters (UTM)** for accurate CAD scaling.")
+# --- USER INTERFACE ---
+st.title("📐 KML to DXF Professional")
+st.markdown("""
+- **Scale:** Automatic Meters (UTM)
+- **View:** Auto-Zoom to Extents
+- **Context:** Automatic OSM Road Import
+""")
 
-uploaded_file = st.sidebar.file_uploader("Upload KML File", type=['kml'])
+uploaded_file = st.sidebar.file_uploader("Upload your KML file", type=['kml'])
 
 if uploaded_file:
+    # Save uploaded file to temp path for Fiona to read
     with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
         tmp.write(uploaded_file.getvalue())
         path = tmp.name
@@ -102,29 +119,45 @@ if uploaded_file:
         gdf = load_kml_properly(path)
         
         if not gdf.empty:
-            col1, col2 = st.columns([1, 3])
+            st.sidebar.success(f"Successfully loaded {len(gdf)} items.")
             
-            with col1:
-                st.metric("Total Objects", len(gdf))
-                if st.button("🚀 Generate DXF (Meters)"):
-                    dxf_path = convert_to_dxf_final(gdf)
-                    with open(dxf_path, "rb") as f:
-                        st.download_button("📥 Download DXF", f, "Project_Meters.dxf", "application/dxf")
+            # Action Button
+            if st.sidebar.button("🚀 Generate & Download DXF"):
+                with st.spinner("Processing drawing..."):
+                    dxf_file_path = convert_to_dxf_full(gdf)
+                    with open(dxf_file_path, "rb") as f:
+                        st.sidebar.download_button(
+                            label="📥 Download AutoCAD File",
+                            data=f,
+                            file_name="Converted_Project_Meters.dxf",
+                            mime="application/dxf"
+                        )
             
-            with col2:
-                # Preview Map
-                center = [gdf.geometry.centroid.y.mean(), gdf.geometry.centroid.x.mean()]
-                m = folium.Map(location=center, zoom_start=16)
-                folium.TileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', 
-                                attr='Google', name='Google Hybrid').add_to(m)
-                
-                for _, row in gdf.iterrows():
-                    if row.geometry.geom_type == 'Point':
-                        folium.CircleMarker([row.geometry.y, row.geometry.x], radius=3, color='red').add_to(m)
-                    else:
-                        folium.PolyLine([[p[1], p[0]] for p in row.geometry.coords], color='lime', weight=2).add_to(m)
-                folium_static(m, width=800)
+            # Preview Map
+            st.subheader("Map Preview (WGS84)")
+            center = [gdf.geometry.centroid.y.mean(), gdf.geometry.centroid.x.mean()]
+            m = folium.Map(location=center, zoom_start=16)
+            folium.TileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', 
+                            attr='Google', name='Google Hybrid').add_to(m)
+            
+            # Plot data on Folium for visual verification
+            for _, row in gdf.iterrows():
+                if row.geometry.geom_type == 'Point':
+                    folium.CircleMarker([row.geometry.y, row.geometry.x], radius=4, color='red').add_to(m)
+                else:
+                    folium.PolyLine([[p[1], p[0]] for p in row.geometry.coords], color='lime', weight=3).add_to(m)
+            
+            folium_static(m, width=1000)
+            
+        else:
+            st.error("The KML file contains no valid Point or LineString data.")
+
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error processing file: {e}")
     finally:
-        if os.path.exists(path): os.unlink(path)
+        # Clean up the temp KML file
+        if os.path.exists(path):
+            os.unlink(path)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("v2.1 | Meters & Auto-Fit Enabled")
