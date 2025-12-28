@@ -5,6 +5,7 @@ import fiona
 import osmnx as ox
 import tempfile
 import os
+import folium
 import pandas as pd
 from shapely.geometry import Point, LineString, MultiLineString
 from shapely.ops import unary_union
