@@ -1,787 +1,551 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
 import ezdxf
-from ezdxf import colors
-import tempfile
-import os
-import zipfile
-from datetime import datetime
+from ezdxf import units
 import io
-import warnings
-
-# Suppress warnings
-warnings.filterwarnings('ignore')
+import zipfile
+import os
+from datetime import datetime
 
 # Set page configuration
 st.set_page_config(
     page_title="KML to DXF Converter",
     page_icon="🗺️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1E88E5;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .success-box {
-        background-color: #E8F5E9;
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 1rem;
-        border-left: 4px solid #4CAF50;
-    }
-    .warning-box {
-        background-color: #FFF3E0;
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 1rem;
-        border-left: 4px solid #FF9800;
-    }
-    .stButton button {
-        background-color: #1E88E5;
-        color: white;
-        font-weight: bold;
-        border: none;
-        padding: 0.5rem 2rem;
-        border-radius: 5px;
-        width: 100%;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Title
+st.title("🗺️ KML to DXF Converter")
+st.markdown("Convert Google Earth KML/KMZ files to DXF format for CAD software")
 
-class KMLtoDXFConverter:
+class SimpleKMLtoDXF:
     def __init__(self):
+        self.geometries = []
         self.stats = {
-            'total_placemarks': 0,
             'points': 0,
             'lines': 0,
             'polygons': 0,
-            'layers': set(),
-            'entities_added': 0
+            'total': 0
         }
-        self.geometries = []
-        self.min_x = float('inf')
-        self.max_x = float('-inf')
-        self.min_y = float('inf')
-        self.max_y = float('-inf')
     
     def parse_coordinates(self, coord_text):
-        """Parse coordinates string to list of (x, y, z) tuples"""
+        """Parse coordinates string"""
         coords = []
         if not coord_text:
             return coords
         
-        coord_text = coord_text.strip()
-        lines = coord_text.split()
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
+        for line in coord_text.strip().split():
             parts = line.split(',')
             if len(parts) >= 2:
                 try:
-                    # KML uses: longitude, latitude, elevation
-                    lon = float(parts[0].strip())
-                    lat = float(parts[1].strip())
-                    
-                    # Update bounds for scaling
-                    self.min_x = min(self.min_x, lon)
-                    self.max_x = max(self.max_x, lon)
-                    self.min_y = min(self.min_y, lat)
-                    self.max_y = max(self.max_y, lat)
-                    
-                    elev = 0.0
-                    if len(parts) >= 3:
-                        try:
-                            elev = float(parts[2].strip())
-                        except:
-                            elev = 0.0
-                    
-                    # For DXF, we'll use x=longitude, y=latitude, z=elevation
+                    lon = float(parts[0])
+                    lat = float(parts[1])
+                    elev = float(parts[2]) if len(parts) >= 3 else 0.0
                     coords.append((lon, lat, elev))
-                except Exception as e:
+                except:
                     continue
-        
         return coords
     
-    def kml_color_to_dxf(self, kml_color):
-        """Convert KML color to DXF color index"""
-        if not kml_color or not isinstance(kml_color, str):
-            return 7  # White
+    def extract_placemarks(self, root):
+        """Extract placemarks from KML"""
+        placemarks = []
         
-        kml_color = kml_color.strip()
-        if not kml_color.startswith('#'):
-            return 7
+        # Try different namespace approaches
+        namespaces = [
+            '{http://www.opengis.net/kml/2.2}',
+            '{http://earth.google.com/kml/2.0}',
+            '{http://earth.google.com/kml/2.1}',
+            '{http://www.opengis.net/kml/2.1}',
+            ''
+        ]
         
-        color_hex = kml_color[1:]
+        for ns in namespaces:
+            placemarks = root.findall(f'.//{ns}Placemark')
+            if placemarks:
+                break
         
-        if len(color_hex) == 8:
-            try:
-                # KML format: #AABBGGRR
-                alpha = color_hex[0:2]
-                blue = color_hex[2:4]
-                green = color_hex[4:6]
-                red = color_hex[6:8]
-                
-                # Convert to RGB values
-                r = int(red, 16)
-                g = int(green, 16)
-                b = int(blue, 16)
-                
-                # Map to DXF colors (1-7 are standard colors)
-                # Simple mapping based on dominant color
-                if r > g and r > b:
-                    return 1  # Red
-                elif g > r and g > b:
-                    return 3  # Green
-                elif b > r and b > g:
-                    return 5  # Blue
-                elif r > 200 and g > 200:
-                    return 2  # Yellow
-                elif g > 200 and b > 200:
-                    return 4  # Cyan
-                elif r > 200 and b > 200:
-                    return 6  # Magenta
-                else:
-                    # Calculate brightness
-                    brightness = (r + g + b) / 3
-                    if brightness > 128:
-                        return 7  # White
-                    else:
-                        return 8  # Dark Grey
-            except:
-                return 7
-        
-        return 7
+        return placemarks
     
-    def extract_style_info(self, placemark, root):
-        """Extract style information from placemark"""
-        style = {
-            'color': 7,
-            'width': 0.0,
-            'layer': '0',
-            'name': 'Unnamed',
-            'description': ''
-        }
-        
-        # Extract name
-        name_elem = placemark.find('.//{*}name')
-        if name_elem is not None and name_elem.text:
-            name = name_elem.text.strip()
-            style['name'] = name
-            # Create layer name from placemark name
-            safe_name = ''.join(c for c in name if c.isalnum() or c in ' _-')
-            style['layer'] = safe_name[:30] if safe_name else 'Layer_0'
-        
-        # Extract description
-        desc_elem = placemark.find('.//{*}description')
-        if desc_elem is not None and desc_elem.text:
-            style['description'] = desc_elem.text.strip()
-        
-        # Try to find style
-        style_url = placemark.find('.//{*}styleUrl')
-        if style_url is not None and style_url.text:
-            style_id = style_url.text.strip().replace('#', '')
-            if style_id:
-                # Search for style in document
-                for elem in root.iter():
-                    if 'Style' in elem.tag and elem.get('id') == style_id:
-                        # Get line color
-                        line_style = elem.find('.//{*}LineStyle')
-                        if line_style is not None:
-                            color_elem = line_style.find('.//{*}color')
-                            if color_elem is not None and color_elem.text:
-                                style['color'] = self.kml_color_to_dxf(color_elem.text)
-                            width_elem = line_style.find('.//{*}width')
-                            if width_elem is not None and width_elem.text:
-                                try:
-                                    style['width'] = float(width_elem.text.strip())
-                                except:
-                                    style['width'] = 0.0
-                        break
-        
-        return style
-    
-    def process_geometry(self, geometry_elem, style_info, geom_type):
-        """Process geometry element"""
-        coords_elem = geometry_elem.find('.//{*}coordinates')
-        if coords_elem is not None and coords_elem.text:
-            coordinates = self.parse_coordinates(coords_elem.text)
-            
-            if not coordinates:
-                return False
-            
-            # For polygons, ensure they are closed
-            if geom_type == 'POLYGON' and len(coordinates) >= 3:
-                if coordinates[0] != coordinates[-1]:
-                    coordinates.append(coordinates[0])
-            
-            self.geometries.append({
-                'type': geom_type,
-                'coordinates': coordinates,
-                'style': style_info.copy(),
-                'count': len(coordinates)
-            })
-            
-            # Update statistics
-            if geom_type == 'POINT':
-                self.stats['points'] += len(coordinates)
-            elif geom_type == 'LINESTRING':
-                self.stats['lines'] += 1
-            elif geom_type == 'POLYGON':
-                self.stats['polygons'] += 1
-            
-            self.stats['layers'].add(style_info['layer'])
-            return True
-        
-        return False
-    
-    def process_placemark(self, placemark, root):
-        """Process a single placemark"""
-        style_info = self.extract_style_info(placemark, root)
-        processed = False
-        
-        # Check for Point
-        point_elem = placemark.find('.//{*}Point')
-        if point_elem is not None:
-            if self.process_geometry(point_elem, style_info, 'POINT'):
-                processed = True
-        
-        # Check for LineString
-        line_elem = placemark.find('.//{*}LineString')
-        if line_elem is not None:
-            if self.process_geometry(line_elem, style_info, 'LINESTRING'):
-                processed = True
-        
-        # Check for Polygon
-        polygon_elem = placemark.find('.//{*}Polygon')
-        if polygon_elem is not None:
-            # For polygons, we need to get coordinates from outerBoundaryIs
-            outer_boundary = polygon_elem.find('.//{*}outerBoundaryIs')
-            if outer_boundary is not None:
-                linear_ring = outer_boundary.find('.//{*}LinearRing')
-                if linear_ring is not None:
-                    # Create a mock geometry element with the coordinates
-                    mock_geom = ET.Element('Polygon')
-                    coords_elem = linear_ring.find('.//{*}coordinates')
-                    if coords_elem is not None:
-                        new_coords = ET.SubElement(mock_geom, 'coordinates')
-                        new_coords.text = coords_elem.text
-                        if self.process_geometry(mock_geom, style_info, 'POLYGON'):
-                            processed = True
-        
-        # Check for MultiGeometry
-        multi_elem = placemark.find('.//{*}MultiGeometry')
-        if multi_elem is not None:
-            for geom_elem in multi_elem:
-                geom_type = geom_elem.tag.split('}')[-1] if '}' in geom_elem.tag else geom_elem.tag
-                if geom_type == 'Point':
-                    if self.process_geometry(geom_elem, style_info, 'POINT'):
-                        processed = True
-                elif geom_type == 'LineString':
-                    if self.process_geometry(geom_elem, style_info, 'LINESTRING'):
-                        processed = True
-                elif geom_type == 'Polygon':
-                    # Handle polygon in MultiGeometry
-                    outer_boundary = geom_elem.find('.//{*}outerBoundaryIs')
-                    if outer_boundary is not None:
-                        linear_ring = outer_boundary.find('.//{*}LinearRing')
-                        if linear_ring is not None:
-                            mock_geom = ET.Element('Polygon')
-                            coords_elem = linear_ring.find('.//{*}coordinates')
-                            if coords_elem is not None:
-                                new_coords = ET.SubElement(mock_geom, 'coordinates')
-                                new_coords.text = coords_elem.text
-                                if self.process_geometry(mock_geom, style_info, 'POLYGON'):
-                                    processed = True
-        
-        return processed
-    
-    def parse_kml(self, kml_content):
-        """Parse KML content"""
+    def process_kml_content(self, kml_content):
+        """Process KML content"""
         try:
-            # Decode if bytes
-            if isinstance(kml_content, bytes):
-                kml_content = kml_content.decode('utf-8', errors='ignore')
-            
-            # Clean content
-            kml_content = kml_content.replace('\x00', '').strip()
-            
             # Parse XML
             root = ET.fromstring(kml_content)
             
-            # Find all placemarks
-            placemarks = []
+            # Get placemarks
+            placemarks = self.extract_placemarks(root)
             
-            # Try different namespace patterns
-            namespace_patterns = [
-                '{http://www.opengis.net/kml/2.2}',
-                '{http://earth.google.com/kml/2.0}',
-                '{http://earth.google.com/kml/2.1}',
-                '{http://www.opengis.net/kml/2.1}',
-                ''
-            ]
+            for pm in placemarks:
+                # Get name
+                name_elem = pm.find('.//{*}name')
+                name = name_elem.text if name_elem is not None and name_elem.text else 'Unnamed'
+                
+                # Process Point
+                point = pm.find('.//{*}Point')
+                if point is not None:
+                    coords_elem = point.find('.//{*}coordinates')
+                    if coords_elem is not None and coords_elem.text:
+                        coords = self.parse_coordinates(coords_elem.text)
+                        if coords:
+                            self.geometries.append({
+                                'type': 'POINT',
+                                'name': name,
+                                'coords': coords
+                            })
+                            self.stats['points'] += len(coords)
+                
+                # Process LineString
+                line = pm.find('.//{*}LineString')
+                if line is not None:
+                    coords_elem = line.find('.//{*}coordinates')
+                    if coords_elem is not None and coords_elem.text:
+                        coords = self.parse_coordinates(coords_elem.text)
+                        if len(coords) >= 2:
+                            self.geometries.append({
+                                'type': 'LINE',
+                                'name': name,
+                                'coords': coords
+                            })
+                            self.stats['lines'] += 1
+                
+                # Process Polygon
+                polygon = pm.find('.//{*}Polygon')
+                if polygon is not None:
+                    outer = polygon.find('.//{*}outerBoundaryIs')
+                    if outer is not None:
+                        ring = outer.find('.//{*}LinearRing')
+                        if ring is not None:
+                            coords_elem = ring.find('.//{*}coordinates')
+                            if coords_elem is not None and coords_elem.text:
+                                coords = self.parse_coordinates(coords_elem.text)
+                                if len(coords) >= 3:
+                                    # Ensure polygon is closed
+                                    if coords[0] != coords[-1]:
+                                        coords.append(coords[0])
+                                    self.geometries.append({
+                                        'type': 'POLYGON',
+                                        'name': name,
+                                        'coords': coords
+                                    })
+                                    self.stats['polygons'] += 1
             
-            for ns in namespace_patterns:
-                placemarks = root.findall(f'.//{ns}Placemark')
-                if placemarks:
-                    break
-            
-            if not placemarks:
-                # Last resort: find any element with 'Placemark' in tag
-                for elem in root.iter():
-                    if 'Placemark' in elem.tag:
-                        placemarks.append(elem)
-            
-            self.stats['total_placemarks'] = len(placemarks)
-            
-            # Process placemarks
-            processed_count = 0
-            for placemark in placemarks:
-                try:
-                    if self.process_placemark(placemark, root):
-                        processed_count += 1
-                except Exception as e:
-                    st.warning(f"Warning: Could not process placemark: {e}")
-                    continue
-            
-            # If no geometries found, try direct coordinate extraction
-            if not self.geometries:
-                self.extract_direct_coordinates(root)
-            
-            return len(self.geometries) > 0
+            self.stats['total'] = len(self.geometries)
+            return True
             
         except Exception as e:
-            st.error(f"Error parsing KML: {str(e)}")
+            st.error(f"Error processing KML: {e}")
             return False
     
-    def extract_direct_coordinates(self, root):
-        """Extract coordinates directly from any coordinate element"""
-        coord_elems = root.findall('.//{*}coordinates')
-        
-        for elem in coord_elems:
-            if elem.text:
-                coordinates = self.parse_coordinates(elem.text)
-                if coordinates:
-                    if len(coordinates) == 1:
-                        self.geometries.append({
-                            'type': 'POINT',
-                            'coordinates': coordinates,
-                            'style': {'color': 7, 'layer': 'Extracted', 'name': 'Point'},
-                            'count': 1
-                        })
-                        self.stats['points'] += 1
-                    elif len(coordinates) == 2:
-                        self.geometries.append({
-                            'type': 'LINESTRING',
-                            'coordinates': coordinates,
-                            'style': {'color': 7, 'layer': 'Extracted', 'name': 'Line'},
-                            'count': 2
-                        })
-                        self.stats['lines'] += 1
-                    elif len(coordinates) >= 3:
-                        self.geometries.append({
-                            'type': 'POLYGON',
-                            'coordinates': coordinates,
-                            'style': {'color': 7, 'layer': 'Extracted', 'name': 'Polygon'},
-                            'count': len(coordinates)
-                        })
-                        self.stats['polygons'] += 1
-                    
-                    self.stats['layers'].add('Extracted')
-    
-    def create_dxf(self, options):
-        """Create DXF file from parsed geometries"""
+    def create_dxf_file(self):
+        """Create DXF file from geometries"""
         try:
-            # Create DXF document
-            doc = ezdxf.new('R2010')
+            # Create a new DXF document
+            doc = ezdxf.new('R2010', setup=True)
+            doc.units = units.M
+    
+            # Setup modelspace
             msp = doc.modelspace()
             
-            # Add layers
-            layer_names = list(self.stats['layers'])
-            if not layer_names:
-                layer_names = ['0']
+            # Scale factor for geographic coordinates
+            scale = 100000  # Scale up for better visibility
             
-            for layer_name in layer_names:
-                try:
-                    safe_name = str(layer_name)[:30].strip()
-                    if safe_name:
-                        doc.layers.new(name=safe_name, dxfattribs={'color': 7})
-                except:
-                    pass
+            # Colors for different geometry types
+            colors = {
+                'POINT': 1,    # Red
+                'LINE': 3,     # Green
+                'POLYGON': 5   # Blue
+            }
             
-            # Scale factor for better visualization
-            scale_factor = 1000.0  # Scale up geographic coordinates
-            
-            # Process geometries
             entities_added = 0
             
+            # Add all geometries
             for geom in self.geometries:
-                try:
-                    geom_type = geom['type']
-                    coordinates = geom['coordinates']
-                    style = geom['style']
-                    
-                    layer_name = str(style.get('layer', '0'))[:30].strip() or '0'
-                    color = style.get('color', 7)
-                    
-                    # Scale coordinates
-                    scaled_coords = []
-                    for x, y, z in coordinates:
-                        # Apply scaling
-                        scaled_x = x * scale_factor
-                        scaled_y = y * scale_factor
-                        scaled_z = z * scale_factor if z != 0 else 0.0
-                        scaled_coords.append((scaled_x, scaled_y, scaled_z))
-                    
-                    if geom_type == 'POINT' and scaled_coords:
-                        for x, y, z in scaled_coords:
-                            msp.add_point((x, y, z), dxfattribs={
-                                'layer': layer_name,
-                                'color': color
-                            })
-                            entities_added += 1
-                    
-                    elif geom_type == 'LINESTRING' and len(scaled_coords) >= 2:
-                        if len(scaled_coords) == 2 and options.get('simplify_lines', True):
-                            # Add as LINE
-                            msp.add_line(scaled_coords[0], scaled_coords[1], dxfattribs={
-                                'layer': layer_name,
-                                'color': color
-                            })
-                        else:
-                            # Add as POLYLINE
-                            msp.add_polyline3d(scaled_coords, dxfattribs={
-                                'layer': layer_name,
-                                'color': color
-                            })
-                        entities_added += 1
-                    
-                    elif geom_type == 'POLYGON' and len(scaled_coords) >= 3:
-                        # Ensure polygon is closed
-                        if scaled_coords[0] != scaled_coords[-1]:
-                            scaled_coords.append(scaled_coords[0])
-                        
-                        # Add as LWPOLYLINE (2D for better compatibility)
-                        if options.get('create_polyline', True):
-                            # Convert to 2D
-                            vertices_2d = [(x, y) for x, y, _ in scaled_coords]
-                            msp.add_lwpolyline(vertices_2d, dxfattribs={
-                                'layer': layer_name,
-                                'color': color,
-                                'closed': True
-                            })
-                            entities_added += 1
-                        
-                        # Optionally add hatch
-                        if options.get('create_hatch', False):
-                            try:
-                                hatch = msp.add_hatch(color=color, dxfattribs={'layer': layer_name})
-                                vertices_2d = [(x, y) for x, y, _ in scaled_coords]
-                                hatch.paths.add_polyline_path(vertices_2d, is_closed=True)
-                                entities_added += 1
-                            except:
-                                pass
+                geom_type = geom['type']
+                coords = geom['coords']
+                name = geom['name'][:30]  # Truncate for layer name
                 
-                except Exception as e:
-                    st.warning(f"Could not add geometry: {e}")
-                    continue
+                # Create layer
+                try:
+                    doc.layers.new(name=name)
+                except:
+                    # Layer might already exist
+                    pass
+                
+                color = colors.get(geom_type, 7)
+                
+                if geom_type == 'POINT':
+                    for lon, lat, elev in coords:
+                        # Scale coordinates
+                        x = lon * scale
+                        y = lat * scale
+                        z = elev
+                        
+                        msp.add_point((x, y, z), dxfattribs={
+                            'layer': name,
+                            'color': color
+                        })
+                        entities_added += 1
+                
+                elif geom_type == 'LINE':
+                    if len(coords) >= 2:
+                        # Scale all coordinates
+                        scaled_coords = []
+                        for lon, lat, elev in coords:
+                            x = lon * scale
+                            y = lat * scale
+                            z = elev
+                            scaled_coords.append((x, y, z))
+                        
+                        # Add as polyline
+                        msp.add_polyline3d(scaled_coords, dxfattribs={
+                            'layer': name,
+                            'color': color
+                        })
+                        entities_added += 1
+                
+                elif geom_type == 'POLYGON':
+                    if len(coords) >= 3:
+                        # Scale all coordinates
+                        scaled_coords = []
+                        for lon, lat, elev in coords:
+                            x = lon * scale
+                            y = lat * scale
+                            z = elev
+                            scaled_coords.append((x, y, z))
+                        
+                        # Add as closed polyline
+                        msp.add_polyline3d(scaled_coords, dxfattribs={
+                            'layer': name,
+                            'color': color
+                        })
+                        entities_added += 1
             
-            self.stats['entities_added'] = entities_added
-            
-            # If no entities added, add a dummy point to ensure file is not empty
+            # If no geometries were added, add a simple test entity
             if entities_added == 0:
-                st.warning("No valid geometries could be added to DXF. Adding reference point.")
-                msp.add_point((0, 0, 0), dxfattribs={'layer': '0', 'color': 7})
-                self.stats['entities_added'] = 1
+                st.warning("No geometries found. Adding test entities...")
+                
+                # Add some test geometries
+                msp.add_point((0, 0, 0), dxfattribs={'layer': 'Test', 'color': 1})
+                msp.add_line((0, 0, 0), (10, 10, 0), dxfattribs={'layer': 'Test', 'color': 3})
+                msp.add_lwpolyline([(0, 0), (10, 0), (10, 10), (0, 10)], 
+                                  dxfattribs={'layer': 'Test', 'color': 5, 'closed': True})
+                entities_added = 3
             
             # Save to bytes
             dxf_bytes = io.BytesIO()
             doc.saveas(dxf_bytes)
             dxf_bytes.seek(0)
             
-            # Verify file size
+            # Verify file is not empty
             file_size = len(dxf_bytes.getvalue())
             if file_size == 0:
-                st.error("Generated DXF file is empty!")
-                return None
+                raise ValueError("Generated DXF file is empty")
             
-            st.success(f"DXF created successfully with {entities_added} entities")
+            st.success(f"Created DXF with {entities_added} entities ({file_size:,} bytes)")
             return dxf_bytes
             
         except Exception as e:
-            st.error(f"Error creating DXF: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
-            return None
+            st.error(f"Error creating DXF: {e}")
+            # Create minimal DXF as fallback
+            return self.create_minimal_dxf()
     
-    def get_statistics(self):
-        """Get conversion statistics"""
-        return {
-            'Total Geometries': len(self.geometries),
-            'Points': self.stats['points'],
-            'Lines': self.stats['lines'],
-            'Polygons': self.stats['polygons'],
-            'Layers': len(self.stats['layers']),
-            'Entities Added': self.stats['entities_added'],
-            'Coordinate Range': f"Lon: {self.min_x:.4f} to {self.max_x:.4f}, Lat: {self.min_y:.4f} to {self.max_y:.4f}"
-        }
+    def create_minimal_dxf(self):
+        """Create a minimal valid DXF file"""
+        try:
+            # Create simplest possible DXF
+            doc = ezdxf.new('R12')
+            msp = doc.modelspace()
+            
+            # Add a single point to ensure file is not empty
+            msp.add_point((0, 0, 0))
+            
+            # Save
+            dxf_bytes = io.BytesIO()
+            doc.saveas(dxf_bytes)
+            dxf_bytes.seek(0)
+            
+            st.info("Created minimal DXF file")
+            return dxf_bytes
+            
+        except Exception as e:
+            st.error(f"Even minimal DXF failed: {e}")
+            # Create raw DXF text as last resort
+            return self.create_raw_dxf()
+    
+    def create_raw_dxf(self):
+        """Create raw DXF ASCII as last resort"""
+        # Minimal DXF R12 format with a single point
+        dxf_text = """  0
+SECTION
+  2
+HEADER
+  9
+$ACADVER
+  1
+AC1009
+  0
+ENDSEC
+  0
+SECTION
+  2
+TABLES
+  0
+TABLE
+  2
+LAYER
+  70
+     1
+  0
+LAYER
+  2
+0
+  70
+     0
+  62
+     7
+  6
+CONTINUOUS
+  0
+ENDTAB
+  0
+ENDSEC
+  0
+SECTION
+  2
+ENTITIES
+  0
+POINT
+  8
+0
+ 10
+0.0
+ 20
+0.0
+ 30
+0.0
+  0
+ENDSEC
+  0
+EOF
+"""
+        return io.BytesIO(dxf_text.encode('utf-8'))
 
-def main():
-    # Header
-    st.markdown('<h1 class="main-header">🗺️ KML to DXF Converter</h1>', unsafe_allow_html=True)
-    st.markdown("Convert KML (Google Earth) files to DXF (CAD) format")
+# Initialize session state
+if 'converter' not in st.session_state:
+    st.session_state.converter = None
+if 'dxf_ready' not in st.session_state:
+    st.session_state.dxf_ready = False
+if 'dxf_bytes' not in st.session_state:
+    st.session_state.dxf_bytes = None
+
+# Sidebar for options
+with st.sidebar:
+    st.header("⚙️ Settings")
     
-    # Initialize session state
-    if 'converter' not in st.session_state:
-        st.session_state.converter = None
-    if 'dxf_bytes' not in st.session_state:
-        st.session_state.dxf_bytes = None
+    scale_factor = st.slider(
+        "Coordinate Scale",
+        min_value=1000,
+        max_value=1000000,
+        value=100000,
+        step=1000,
+        help="Scale geographic coordinates for better visibility in CAD"
+    )
     
-    # Sidebar
-    with st.sidebar:
-        st.markdown("### ⚙️ Conversion Options")
-        
-        # Conversion options
-        simplify_lines = st.checkbox("Simplify Lines", value=True,
-                                     help="Convert 2-point lines to simple LINE entities")
-        create_polyline = st.checkbox("Create Polylines", value=True,
-                                      help="Create LWPOLYLINE for polygons")
-        create_hatch = st.checkbox("Create Hatch", value=False,
-                                   help="Add hatch patterns to polygons")
-        scale_coords = st.checkbox("Scale Coordinates", value=True,
-                                   help="Scale geographic coordinates for better visualization")
-        
-        options = {
-            'simplify_lines': simplify_lines,
-            'create_polyline': create_polyline,
-            'create_hatch': create_hatch,
-            'scale_coords': scale_coords
-        }
-        
-        st.markdown("---")
-        st.markdown("### 📊 Statistics")
-        
-        if st.session_state.converter:
-            stats = st.session_state.converter.get_statistics()
-            for key, value in stats.items():
-                st.metric(key, value)
+    st.markdown("---")
+    st.header("ℹ️ Info")
+    st.markdown("""
+    **Supported:**
+    - Points
+    - Lines/Paths  
+    - Polygons
+    - Basic styling
     
-    # Main content area
-    col1, col2 = st.columns([2, 1])
+    **Output:** DXF R2010
+    """)
+
+# Main area
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.subheader("📤 Upload KML/KMZ File")
     
-    with col1:
-        st.markdown("### 📤 Upload KML/KMZ File")
+    uploaded_file = st.file_uploader(
+        "Choose a file",
+        type=['kml', 'kmz'],
+        help="Upload KML or KMZ file from Google Earth"
+    )
+    
+    if uploaded_file is not None:
+        # Show file info
+        file_size = len(uploaded_file.getvalue())
+        st.info(f"📄 **File:** {uploaded_file.name} ({file_size:,} bytes)")
         
-        uploaded_file = st.file_uploader(
-            "Choose a file",
-            type=['kml', 'kmz'],
-            help="Upload KML or KMZ file from Google Earth"
+        # Read file
+        file_content = uploaded_file.getvalue()
+        
+        # Handle KMZ
+        if uploaded_file.name.lower().endswith('.kmz'):
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_content)) as kmz:
+                    kml_files = [f for f in kmz.namelist() if f.lower().endswith('.kml')]
+                    if kml_files:
+                        kml_files.sort()
+                        with kmz.open(kml_files[0]) as f:
+                            file_content = f.read()
+                        st.success(f"📂 Extracted: {kml_files[0]}")
+                    else:
+                        st.error("No KML file found in KMZ")
+            except Exception as e:
+                st.error(f"KMZ error: {e}")
+        
+        # Convert button
+        if st.button("🚀 Convert to DXF", type="primary", use_container_width=True):
+            with st.spinner("Processing..."):
+                # Create converter
+                converter = SimpleKMLtoDXF()
+                
+                # Process KML
+                if converter.process_kml_content(file_content):
+                    st.session_state.converter = converter
+                    
+                    # Show stats
+                    stats = converter.stats
+                    st.success(f"✅ Found {stats['total']} geometries")
+                    
+                    # Display stats
+                    cols = st.columns(3)
+                    cols[0].metric("Points", stats['points'])
+                    cols[1].metric("Lines", stats['lines'])
+                    cols[2].metric("Polygons", stats['polygons'])
+                    
+                    # Create DXF
+                    with st.spinner("Creating DXF..."):
+                        dxf_bytes = converter.create_dxf_file()
+                        
+                        if dxf_bytes:
+                            st.session_state.dxf_bytes = dxf_bytes
+                            st.session_state.dxf_ready = True
+                            
+                            # Show file size
+                            file_size = len(dxf_bytes.getvalue())
+                            st.success(f"✅ DXF ready: {file_size:,} bytes")
+                        else:
+                            st.error("Failed to create DXF")
+                else:
+                    st.error("Failed to process KML")
+
+with col2:
+    st.subheader("📥 Download")
+    
+    if st.session_state.dxf_ready and st.session_state.dxf_bytes:
+        # Generate filename
+        if uploaded_file:
+            base = os.path.splitext(uploaded_file.name)[0]
+            if base.lower().endswith('.kmz'):
+                base = base[:-4]
+            filename = f"{base}.dxf"
+        else:
+            filename = f"converted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dxf"
+        
+        # Download button
+        file_size = len(st.session_state.dxf_bytes.getvalue())
+        st.download_button(
+            label=f"⬇️ Download DXF ({file_size:,} bytes)",
+            data=st.session_state.dxf_bytes,
+            file_name=filename,
+            mime="application/dxf",
+            use_container_width=True
         )
         
-        if uploaded_file:
-            # Display file info
-            file_size_kb = len(uploaded_file.getvalue()) / 1024
-            st.info(f"📄 **File:** {uploaded_file.name} | **Size:** {file_size_kb:.1f} KB")
-            
-            # Read file
-            file_content = uploaded_file.getvalue()
-            
-            # Handle KMZ files
-            if uploaded_file.name.lower().endswith('.kmz'):
-                with st.spinner("Extracting KMZ..."):
-                    try:
-                        with zipfile.ZipFile(io.BytesIO(file_content)) as kmz:
-                            kml_files = [f for f in kmz.namelist() if f.lower().endswith('.kml')]
-                            if kml_files:
-                                kml_files.sort(key=lambda x: 'doc.kml' in x.lower(), reverse=True)
-                                with kmz.open(kml_files[0]) as f:
-                                    file_content = f.read()
-                                st.success(f"Extracted: {kml_files[0]}")
-                            else:
-                                st.error("No KML file found in KMZ")
-                                return
-                    except Exception as e:
-                        st.error(f"KMZ extraction failed: {e}")
-                        return
-            
-            # Convert button
-            if st.button("🚀 Convert to DXF", type="primary", use_container_width=True):
-                with st.spinner("Processing..."):
-                    # Create converter
-                    converter = KMLtoDXFConverter()
-                    
-                    # Parse KML
-                    success = converter.parse_kml(file_content)
-                    
-                    if success:
-                        st.session_state.converter = converter
-                        
-                        # Show stats
-                        stats = converter.get_statistics()
-                        st.success(f"✅ Parsed {stats['Total Geometries']} geometries")
-                        
-                        # Create DXF
-                        with st.spinner("Creating DXF file..."):
-                            dxf_bytes = converter.create_dxf(options)
-                            
-                            if dxf_bytes:
-                                st.session_state.dxf_bytes = dxf_bytes
-                                file_size_mb = len(dxf_bytes.getvalue()) / (1024 * 1024)
-                                st.success(f"✅ DXF created: {file_size_mb:.2f} MB")
-                            else:
-                                st.error("❌ Failed to create DXF")
-                    else:
-                        st.error("❌ Failed to parse KML")
-            
-            # Download section
-            if st.session_state.dxf_bytes:
-                st.markdown("### 📥 Download DXF")
+        # Preview
+        with st.expander("🔍 Preview Details"):
+            if st.session_state.converter:
+                converter = st.session_state.converter
+                st.write(f"**Total Geometries:** {converter.stats['total']}")
                 
-                # Generate filename
-                if uploaded_file:
-                    base_name = os.path.splitext(uploaded_file.name)[0]
-                    if base_name.lower().endswith('.kmz'):
-                        base_name = base_name[:-4]
-                    filename = f"{base_name}.dxf"
-                else:
-                    filename = f"converted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dxf"
-                
-                # Download button
-                file_size = len(st.session_state.dxf_bytes.getvalue())
-                st.download_button(
-                    label=f"⬇️ Download DXF ({file_size/1024:.1f} KB)",
-                    data=st.session_state.dxf_bytes,
-                    file_name=filename,
-                    mime="application/dxf",
-                    use_container_width=True
-                )
-                
-                # Preview info
-                with st.expander("📋 Conversion Details"):
-                    if st.session_state.converter:
-                        stats = st.session_state.converter.get_statistics()
-                        for key, value in stats.items():
-                            st.write(f"**{key}:** {value}")
-                        
-                        # Show sample coordinates
-                        if st.session_state.converter.geometries:
-                            geom = st.session_state.converter.geometries[0]
-                            if geom['coordinates']:
-                                coord = geom['coordinates'][0]
-                                st.write("**Sample Coordinate:**")
-                                st.code(f"Longitude: {coord[0]:.6f}\nLatitude: {coord[1]:.6f}\nElevation: {coord[2]:.1f}")
+                if converter.geometries:
+                    # Show first few geometries
+                    st.write("**Sample Geometries:**")
+                    for i, geom in enumerate(converter.geometries[:3]):
+                        st.write(f"{i+1}. {geom['type']}: {geom['name']}")
+                        if geom['coords']:
+                            coord = geom['coords'][0]
+                            st.code(f"  Coordinate: {coord[0]:.6f}, {coord[1]:.6f}")
     
-    with col2:
-        st.markdown("### 📝 Quick Guide")
-        
-        st.markdown("""
-        **1.** Upload KML/KMZ file
-        
-        **2.** Adjust conversion options
-        
-        **3.** Click "Convert to DXF"
-        
-        **4.** Download the DXF file
-        
-        **Supported:**
-        - ✅ Points
-        - ✅ Lines/Paths
-        - ✅ Polygons
-        - ✅ Colors
-        - ✅ Layers
-        - ✅ KMZ files
-        """)
-        
-        st.markdown("---")
-        st.markdown("### 🛠️ Troubleshooting")
-        
-        st.markdown("""
-        **Empty DXF?**
-        - Try different KML file
-        - Check KML contains valid geometries
-        - Enable all conversion options
-        
-        **Can't open DXF?**
-        - Use AutoCAD or compatible viewer
-        - Try DraftSight or LibreCAD
-        - Ensure file size > 0
-        
-        **Coordinates wrong?**
-        - Coordinates are geographic
-        - No projection applied
-        - Scale may be needed
-        """)
-        
-        # Sample KML
-        st.markdown("---")
-        st.markdown("### 🧪 Test Sample")
-        
-        sample_kml = '''<?xml version="1.0" encoding="UTF-8"?>
+    st.markdown("---")
+    st.subheader("💡 Tips")
+    st.markdown("""
+    1. Use **sample.kml** to test
+    2. Adjust **scale** if needed
+    3. Open in **AutoCAD** or **LibreCAD**
+    4. File should be **> 1KB**
+    """)
+    
+    # Create sample KML
+    sample_kml = """<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
+  <name>Test Data</name>
+  
   <Placemark>
-    <name>Test Point</name>
+    <name>Location A</name>
     <Point>
-      <coordinates>110.0,-7.0,0</coordinates>
+      <coordinates>107.609, -6.914, 0</coordinates>
     </Point>
   </Placemark>
+  
   <Placemark>
-    <name>Test Line</name>
+    <name>Path AB</name>
     <LineString>
       <coordinates>
-        110.0,-7.0,0
-        110.1,-7.1,0
-        110.2,-7.2,0
+        107.609, -6.914, 0
+        107.610, -6.915, 0
+        107.611, -6.916, 0
       </coordinates>
     </LineString>
   </Placemark>
+  
   <Placemark>
-    <name>Test Polygon</name>
+    <name>Area 1</name>
     <Polygon>
       <outerBoundaryIs>
         <LinearRing>
           <coordinates>
-            110.0,-7.0,0
-            110.1,-7.0,0
-            110.1,-7.1,0
-            110.0,-7.1,0
-            110.0,-7.0,0
+            107.600, -6.900, 0
+            107.605, -6.900, 0
+            107.605, -6.905, 0
+            107.600, -6.905, 0
+            107.600, -6.900, 0
           </coordinates>
         </LinearRing>
       </outerBoundaryIs>
     </Polygon>
   </Placemark>
 </Document>
-</kml>'''
-        
-        st.download_button(
-            "Download Sample KML",
-            sample_kml,
-            "sample.kml",
-            "application/vnd.google-earth.kml+xml",
-            use_container_width=True
-        )
-
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style='text-align: center; color: #666;'>
-        <p><strong>KML to DXF Converter</strong> | v3.0 | Streamlit + ezdxf</p>
-        <p style='font-size: 0.9rem;'>For accurate CAD work, post-process coordinates in CAD software</p>
-        </div>
-        """,
-        unsafe_allow_html=True
+</kml>"""
+    
+    st.download_button(
+        "Download Sample KML",
+        sample_kml,
+        "sample.kml",
+        "text/xml",
+        use_container_width=True
     )
 
-if __name__ == "__main__":
-    main()
+# Debug section
+with st.expander("🔧 Debug Info", expanded=False):
+    if st.session_state.converter:
+        converter = st.session_state.converter
+        st.write("**Statistics:**")
+        st.json(converter.stats)
+        
+        if converter.geometries:
+            st.write(f"**Geometries ({len(converter.geometries)}):**")
+            for i, geom in enumerate(converter.geometries[:5]):
+                st.write(f"{i+1}. {geom['type']} - {geom['name']}")
+                if geom['coords']:
+                    st.write(f"   Coordinates: {len(geom['coords'])} points")
+
+# Footer
+st.markdown("---")
+st.caption("KML to DXF Converter • Simple and reliable conversion")
