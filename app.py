@@ -1,17 +1,41 @@
+import xml.etree.ElementTree as ET
 import argparse
 import os
 import sys
-import xml.etree.ElementTree as ET
-import ezdxf
-from ezdxf import colors
 
-class EnhancedKMLtoDXFConverter:
+class KMLtoDXFConverter:
     def __init__(self):
         self.namespace = {'kml': 'http://www.opengis.net/kml/2.2'}
-        self.entities = []
+        self.dxf_entities = []
+        self.layers = {}
+        self.color_map = {
+            'red': 1, 'green': 3, 'blue': 5, 'yellow': 2,
+            'purple': 6, 'cyan': 4, 'white': 7, 'black': 0
+        }
+    
+    def parse_color(self, color_str):
+        """Parse KML color format (aabbggrr) to DXF color index"""
+        if not color_str:
+            return 7  # Default white
         
+        # KML color format: aabbggrr (alpha, blue, green, red)
+        if color_str.startswith('#'):
+            color_str = color_str[1:]
+        
+        if len(color_str) == 8:
+            rr = color_str[6:8]  # Red component
+            # Convert to simple color index based on brightness
+            r_val = int(rr, 16)
+            if r_val > 200:
+                return 1  # Red
+            elif r_val > 100:
+                return 2  # Yellow
+            else:
+                return 7  # White
+        return 7
+    
     def parse_coordinates(self, coord_text):
-        """Parse coordinates string"""
+        """Parse coordinates string to list of (x, y, z) tuples"""
         coords = []
         if not coord_text:
             return coords
@@ -26,327 +50,304 @@ class EnhancedKMLtoDXFConverter:
                 coords.append((x, y, z))
         return coords
     
-    def kml_color_to_dxf(self, kml_color):
-        """Convert KML color to DXF color"""
-        if not kml_color or not kml_color.startswith('#'):
-            return colors.WHITE
-        
-        # KML: #aabbggrr to RGB
-        color_hex = kml_color[1:]
-        if len(color_hex) == 8:
-            rr = color_hex[6:8]
-            gg = color_hex[4:6]
-            bb = color_hex[2:4]
-            return (int(rr, 16), int(gg, 16), int(bb, 16))
-        
-        return colors.WHITE
-    
-    def extract_placemark_info(self, placemark):
-        """Extract information from placemark"""
-        info = {
-            'name': 'Unnamed',
-            'description': '',
-            'style': {},
-            'geometry_type': None,
-            'coordinates': []
+    def extract_style(self, placemark):
+        """Extract style information from placemark"""
+        style = {
+            'color': 7,  # Default white
+            'layer': '0',
+            'linetype': 'CONTINUOUS'
         }
         
-        # Name
-        name_elem = placemark.find('.//kml:name', self.namespace)
-        if name_elem is not None and name_elem.text:
-            info['name'] = name_elem.text
-        
-        # Description
-        desc_elem = placemark.find('.//kml:description', self.namespace)
-        if desc_elem is not None and desc_elem.text:
-            info['description'] = desc_elem.text
-        
-        # Style
+        # Try to get styleUrl
         style_url = placemark.find('.//kml:styleUrl', self.namespace)
         if style_url is not None and style_url.text:
             style_id = style_url.text.replace('#', '')
             
-            # Find style definition
-            root = placemark.getroot()
-            style_def = root.find(f".//kml:Style[@id='{style_id}']", self.namespace)
-            
+            # Find the style definition
+            style_def = placemark.getroot().find(f".//kml:Style[@id='{style_id}']", self.namespace)
             if style_def is None:
-                # Check parent elements
-                parent = placemark.find('..')
-                if parent is not None:
-                    style_def = parent.find(f".//kml:Style[@id='{style_id}']", self.namespace)
+                # Try in Document
+                doc = placemark.find('..')
+                if doc is not None:
+                    style_def = doc.find(f".//kml:Style[@id='{style_id}']", self.namespace)
             
             if style_def is not None:
-                # Line style
+                # Get line style
                 line_style = style_def.find('.//kml:LineStyle', self.namespace)
                 if line_style is not None:
                     color_elem = line_style.find('.//kml:color', self.namespace)
                     if color_elem is not None:
-                        info['style']['color'] = self.kml_color_to_dxf(color_elem.text)
-                    
-                    width_elem = line_style.find('.//kml:width', self.namespace)
-                    if width_elem is not None:
-                        info['style']['width'] = float(width_elem.text)
-                
-                # Polygon style
-                poly_style = style_def.find('.//kml:PolyStyle', self.namespace)
-                if poly_style is not None:
-                    fill_elem = poly_style.find('.//kml:fill', self.namespace)
-                    if fill_elem is not None:
-                        info['style']['fill'] = int(fill_elem.text)
+                        style['color'] = self.parse_color(color_elem.text)
         
-        return info
+        # Get name for layer
+        name_elem = placemark.find('.//kml:name', self.namespace)
+        if name_elem is not None and name_elem.text:
+            style['layer'] = name_elem.text[:31]  # DXF layer names max 31 chars
+        
+        return style
     
-    def process_kml(self, kml_file):
-        """Process KML file"""
+    def process_point(self, placemark, coordinates, style):
+        """Process Point geometry"""
+        if coordinates:
+            x, y, z = coordinates[0]
+            self.dxf_entities.append({
+                'type': 'POINT',
+                'x': x, 'y': y, 'z': z,
+                'layer': style['layer'],
+                'color': style['color']
+            })
+    
+    def process_linestring(self, placemark, coordinates, style):
+        """Process LineString geometry"""
+        if len(coordinates) < 2:
+            return
+        
+        # Create LWPOLYLINE for 2D or 3DPOLYLINE for 3D
+        has_z = any(coord[2] != 0 for coord in coordinates)
+        
+        if has_z:
+            self.dxf_entities.append({
+                'type': '3DPOLYLINE',
+                'vertices': coordinates,
+                'layer': style['layer'],
+                'color': style['color'],
+                'closed': False
+            })
+        else:
+            # Convert to 2D vertices
+            vertices_2d = [(x, y) for x, y, z in coordinates]
+            self.dxf_entities.append({
+                'type': 'LWPOLYLINE',
+                'vertices': vertices_2d,
+                'layer': style['layer'],
+                'color': style['color'],
+                'closed': False
+            })
+    
+    def process_polygon(self, placemark, coordinates, style):
+        """Process Polygon geometry"""
+        if len(coordinates) < 3:
+            return
+        
+        has_z = any(coord[2] != 0 for coord in coordinates)
+        
+        if has_z:
+            self.dxf_entities.append({
+                'type': '3DPOLYLINE',
+                'vertices': coordinates,
+                'layer': style['layer'],
+                'color': style['color'],
+                'closed': True
+            })
+        else:
+            vertices_2d = [(x, y) for x, y, z in coordinates]
+            self.dxf_entities.append({
+                'type': 'LWPOLYLINE',
+                'vertices': vertices_2d,
+                'layer': style['layer'],
+                'color': style['color'],
+                'closed': True
+            })
+    
+    def process_geometry(self, placemark, geometry):
+        """Process geometry element"""
+        style = self.extract_style(placemark)
+        
+        # Handle different geometry types
+        geom_type = geometry.tag.split('}')[-1]
+        
+        if geom_type == 'Point':
+            coord_elem = geometry.find('.//kml:coordinates', self.namespace)
+            if coord_elem is not None:
+                coords = self.parse_coordinates(coord_elem.text)
+                self.process_point(placemark, coords, style)
+        
+        elif geom_type == 'LineString':
+            coord_elem = geometry.find('.//kml:coordinates', self.namespace)
+            if coord_elem is not None:
+                coords = self.parse_coordinates(coord_elem.text)
+                self.process_linestring(placemark, coords, style)
+        
+        elif geom_type == 'Polygon':
+            outer_boundary = geometry.find('.//kml:outerBoundaryIs', self.namespace)
+            if outer_boundary is not None:
+                linear_ring = outer_boundary.find('.//kml:LinearRing', self.namespace)
+                if linear_ring is not None:
+                    coord_elem = linear_ring.find('.//kml:coordinates', self.namespace)
+                    if coord_elem is not None:
+                        coords = self.parse_coordinates(coord_elem.text)
+                        self.process_polygon(placemark, coords, style)
+    
+    def parse_kml(self, kml_file):
+        """Parse KML file and extract geometries"""
         try:
             tree = ET.parse(kml_file)
             root = tree.getroot()
-            
-            # Register namespace
-            if '}' in root.tag:
-                ns = root.tag.split('}')[0].strip('{')
-                self.namespace['kml'] = ns
             
             # Find all placemarks
             placemarks = root.findall('.//kml:Placemark', self.namespace)
             
             if not placemarks:
-                print("No placemarks found. Trying alternative namespace...")
-                # Try common namespaces
-                for ns in ['http://earth.google.com/kml/2.0', 
-                          'http://earth.google.com/kml/2.1',
-                          'http://www.opengis.net/kml/2.1']:
-                    self.namespace['kml'] = ns
-                    placemarks = root.findall('.//kml:Placemark', self.namespace)
-                    if placemarks:
-                        break
+                # Try alternative namespace
+                self.namespace = {'kml': 'http://earth.google.com/kml/2.0'}
+                placemarks = root.findall('.//kml:Placemark', self.namespace)
             
             print(f"Found {len(placemarks)} placemarks")
             
-            for pm in placemarks:
-                info = self.extract_placemark_info(pm)
-                
-                # Check geometry types
-                geometry = None
-                geom_type = None
-                
-                # Point
-                geom = pm.find('.//kml:Point', self.namespace)
-                if geom is not None:
-                    geometry = geom
-                    geom_type = 'POINT'
-                
-                # LineString
-                if geom_type is None:
-                    geom = pm.find('.//kml:LineString', self.namespace)
-                    if geom is not None:
-                        geometry = geom
-                        geom_type = 'LINE'
-                
-                # Polygon
-                if geom_type is None:
-                    geom = pm.find('.//kml:Polygon', self.namespace)
-                    if geom is not None:
-                        geometry = geom
-                        geom_type = 'POLYGON'
-                
-                # MultiGeometry
-                if geom_type is None:
-                    geom = pm.find('.//kml:MultiGeometry', self.namespace)
-                    if geom is not None:
-                        geometry = geom
-                        geom_type = 'MULTI'
-                
+            for placemark in placemarks:
+                # Get geometry
+                geometry = placemark.find('.//kml:Point', self.namespace)
                 if geometry is not None:
-                    info['geometry_type'] = geom_type
-                    
-                    # Get coordinates
-                    if geom_type == 'POLYGON':
-                        outer = geometry.find('.//kml:outerBoundaryIs', self.namespace)
-                        if outer is not None:
-                            ring = outer.find('.//kml:LinearRing', self.namespace)
-                            if ring is not None:
-                                coords_elem = ring.find('.//kml:coordinates', self.namespace)
-                                if coords_elem is not None:
-                                    info['coordinates'] = self.parse_coordinates(coords_elem.text)
-                    else:
-                        coords_elem = geometry.find('.//kml:coordinates', self.namespace)
-                        if coords_elem is not None:
-                            info['coordinates'] = self.parse_coordinates(coords_elem.text)
-                    
-                    # For MultiGeometry, process each sub-geometry
-                    if geom_type == 'MULTI':
-                        sub_geometries = []
-                        for subgeom in geometry:
-                            sub_type = subgeom.tag.split('}')[-1]
-                            sub_coords = []
-                            
-                            if sub_type == 'Polygon':
-                                outer = subgeom.find('.//kml:outerBoundaryIs', self.namespace)
-                                if outer is not None:
-                                    ring = outer.find('.//kml:LinearRing', self.namespace)
-                                    if ring is not None:
-                                        coords_elem = ring.find('.//kml:coordinates', self.namespace)
-                                        if coords_elem is not None:
-                                            sub_coords = self.parse_coordinates(coords_elem.text)
-                            else:
-                                coords_elem = subgeom.find('.//kml:coordinates', self.namespace)
-                                if coords_elem is not None:
-                                    sub_coords = self.parse_coordinates(coords_elem.text)
-                            
-                            if sub_coords:
-                                sub_geometries.append({
-                                    'type': sub_type,
-                                    'coordinates': sub_coords
-                                })
-                        
-                        info['sub_geometries'] = sub_geometries
-                    
-                    self.entities.append(info)
+                    self.process_geometry(placemark, geometry)
+                    continue
+                
+                geometry = placemark.find('.//kml:LineString', self.namespace)
+                if geometry is not None:
+                    self.process_geometry(placemark, geometry)
+                    continue
+                
+                geometry = placemark.find('.//kml:Polygon', self.namespace)
+                if geometry is not None:
+                    self.process_geometry(placemark, geometry)
+                    continue
+                
+                # Try MultiGeometry
+                multi_geom = placemark.find('.//kml:MultiGeometry', self.namespace)
+                if multi_geom is not None:
+                    geometries = multi_geom.findall('*')
+                    for geom in geometries:
+                        self.process_geometry(placemark, geom)
             
-            return True
+            print(f"Processed {len(self.dxf_entities)} DXF entities")
             
+        except ET.ParseError as e:
+            print(f"Error parsing KML file: {e}")
+            return False
         except Exception as e:
             print(f"Error processing KML: {e}")
             return False
+        
+        return True
+    
+    def write_dxf(self, dxf_file):
+        """Write DXF file (simplified ASCII DXF format)"""
+        try:
+            with open(dxf_file, 'w', encoding='utf-8') as f:
+                # DXF Header
+                f.write("0\nSECTION\n")
+                f.write("2\nHEADER\n")
+                f.write("9\n$ACADVER\n1\nAC1009\n")  # R12 format for compatibility
+                f.write("9\n$INSBASE\n10\n0.0\n20\n0.0\n30\n0.0\n")
+                f.write("0\nENDSEC\n")
+                
+                # Tables Section
+                f.write("0\nSECTION\n")
+                f.write("2\nTABLES\n")
+                
+                # Layer Table
+                f.write("0\nTABLE\n")
+                f.write("2\nLAYER\n")
+                f.write("70\n1\n")  # Number of layers
+                
+                # Default layer
+                f.write("0\nLAYER\n")
+                f.write("2\n0\n")  # Layer name
+                f.write("70\n0\n")  # Flags
+                f.write("62\n7\n")  # Color (white)
+                f.write("6\nCONTINUOUS\n")  # Linetype
+                
+                f.write("0\nENDTAB\n")
+                f.write("0\nENDSEC\n")
+                
+                # Entities Section
+                f.write("0\nSECTION\n")
+                f.write("2\nENTITIES\n")
+                
+                for entity in self.dxf_entities:
+                    if entity['type'] == 'POINT':
+                        f.write("0\nPOINT\n")
+                        f.write(f"8\n{entity['layer']}\n")  # Layer
+                        f.write(f"62\n{entity['color']}\n")  # Color
+                        f.write(f"10\n{entity['x']}\n")  # X
+                        f.write(f"20\n{entity['y']}\n")  # Y
+                        f.write(f"30\n{entity['z']}\n")  # Z
+                    
+                    elif entity['type'] == 'LWPOLYLINE':
+                        f.write("0\nLWPOLYLINE\n")
+                        f.write(f"8\n{entity['layer']}\n")
+                        f.write(f"62\n{entity['color']}\n")
+                        f.write(f"90\n{len(entity['vertices'])}\n")  # Number of vertices
+                        f.write(f"70\n{1 if entity['closed'] else 0}\n")  # Closed flag
+                        
+                        for x, y in entity['vertices']:
+                            f.write(f"10\n{x}\n")
+                            f.write(f"20\n{y}\n")
+                    
+                    elif entity['type'] == '3DPOLYLINE':
+                        f.write("0\nPOLYLINE\n")
+                        f.write(f"8\n{entity['layer']}\n")
+                        f.write(f"62\n{entity['color']}\n")
+                        f.write("66\n1\n")  # Vertices follow
+                        f.write(f"70\n{8 if entity['closed'] else 0}\n")  # 3D polyline flag + closed
+                        
+                        for x, y, z in entity['vertices']:
+                            f.write("0\nVERTEX\n")
+                            f.write(f"8\n{entity['layer']}\n")
+                            f.write(f"10\n{x}\n")
+                            f.write(f"20\n{y}\n")
+                            f.write(f"30\n{z}\n")
+                        
+                        f.write("0\nSEQEND\n")
+                
+                f.write("0\nENDSEC\n")
+                f.write("0\nEOF\n")
+            
+            print(f"Successfully wrote DXF file: {dxf_file}")
+            return True
+            
+        except Exception as e:
+            print(f"Error writing DXF file: {e}")
+            return False
     
     def convert(self, kml_file, dxf_file):
-        """Convert KML to DXF using ezdxf"""
+        """Main conversion method"""
         print(f"Converting {kml_file} to {dxf_file}")
         
         if not os.path.exists(kml_file):
-            print(f"Error: File not found: {kml_file}")
+            print(f"Error: KML file not found: {kml_file}")
             return False
         
-        # Process KML
-        if not self.process_kml(kml_file):
+        # Parse KML
+        if not self.parse_kml(kml_file):
             return False
         
-        # Create DXF document
-        doc = ezdxf.new('R2010')  # Use AutoCAD 2010 format
-        msp = doc.modelspace()
-        
-        # Create layers based on entity names
-        layers_created = set()
-        
-        for entity in self.entities:
-            layer_name = entity['name'][:31]  # DXF limit
-            if layer_name not in layers_created:
-                doc.layers.new(name=layer_name)
-                layers_created.add(layer_name)
-            
-            color = entity['style'].get('color', colors.WHITE)
-            
-            if entity['geometry_type'] == 'POINT' and entity['coordinates']:
-                for x, y, z in entity['coordinates']:
-                    msp.add_point((x, y, z), 
-                                 dxfattribs={'layer': layer_name, 'color': color})
-            
-            elif entity['geometry_type'] == 'LINE' and len(entity['coordinates']) >= 2:
-                if len(entity['coordinates']) == 2:
-                    # Simple line
-                    start = entity['coordinates'][0]
-                    end = entity['coordinates'][1]
-                    msp.add_line(start, end, 
-                                dxfattribs={'layer': layer_name, 'color': color})
-                else:
-                    # Polyline
-                    msp.add_polyline3d(entity['coordinates'], 
-                                      dxfattribs={'layer': layer_name, 'color': color})
-            
-            elif entity['geometry_type'] == 'POLYGON' and len(entity['coordinates']) >= 3:
-                # Close the polygon if not closed
-                coords = entity['coordinates']
-                if coords[0] != coords[-1]:
-                    coords.append(coords[0])
-                
-                msp.add_polyline3d(coords, 
-                                  dxfattribs={'layer': layer_name, 'color': color})
-            
-            elif entity['geometry_type'] == 'MULTI' and 'sub_geometries' in entity:
-                for sub in entity['sub_geometries']:
-                    if sub['type'] == 'Point':
-                        for x, y, z in sub['coordinates']:
-                            msp.add_point((x, y, z), 
-                                         dxfattribs={'layer': layer_name, 'color': color})
-                    elif sub['type'] in ['LineString', 'Polygon'] and sub['coordinates']:
-                        coords = sub['coordinates']
-                        if sub['type'] == 'Polygon' and len(coords) >= 3:
-                            if coords[0] != coords[-1]:
-                                coords.append(coords[0])
-                        
-                        if len(coords) == 2:
-                            msp.add_line(coords[0], coords[1], 
-                                        dxfattribs={'layer': layer_name, 'color': color})
-                        else:
-                            msp.add_polyline3d(coords, 
-                                              dxfattribs={'layer': layer_name, 'color': color})
-        
-        # Save DXF file
-        try:
-            doc.saveas(dxf_file)
-            print(f"Successfully created DXF file: {dxf_file}")
-            print(f"Total entities converted: {len(self.entities)}")
-            return True
-        except Exception as e:
-            print(f"Error saving DXF file: {e}")
+        # Write DXF
+        if not self.write_dxf(dxf_file):
             return False
+        
+        return True
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Convert KML (Keyhole Markup Language) to DXF (Drawing Exchange Format)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s input.kml output.dxf
-  %(prog)s "C:\\My Files\\map.kml" "C:\\Output\\drawing.dxf"
-  %(prog)s data.kml --output converted.dxf
-        """
-    )
-    
-    parser.add_argument('input', help='Input KML file path')
-    parser.add_argument('output', nargs='?', help='Output DXF file path (optional)')
-    parser.add_argument('-o', '--output', dest='output_file', 
-                       help='Specify output DXF file path')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                       help='Show detailed conversion information')
-    parser.add_argument('--version', action='version', 
-                       version='KML to DXF Converter 2.0')
+    parser = argparse.ArgumentParser(description='Convert KML to DXF format')
+    parser.add_argument('input', help='Input KML file')
+    parser.add_argument('output', help='Output DXF file')
+    parser.add_argument('--version', action='version', version='KML to DFX Converter 1.0')
     
     args = parser.parse_args()
     
-    # Determine output file
-    if args.output_file:
-        output_path = args.output_file
-    elif args.output:
-        output_path = args.output
-    else:
-        # Auto-generate output filename
-        base_name = os.path.splitext(args.input)[0]
-        output_path = base_name + '.dxf'
-    
-    # Check input file
-    if not os.path.exists(args.input):
-        print(f"Error: Input file does not exist: {args.input}")
-        return 1
-    
+    # Check file extensions
     if not args.input.lower().endswith('.kml'):
         print("Warning: Input file should have .kml extension")
     
+    if not args.output.lower().endswith('.dxf'):
+        args.output = args.output + '.dxf'
+    
     # Perform conversion
-    converter = EnhancedKMLtoDXFConverter()
-    
-    if args.verbose:
-        print("Starting KML to DXF conversion...")
-        print(f"Input:  {args.input}")
-        print(f"Output: {output_path}")
-    
-    success = converter.convert(args.input, output_path)
+    converter = KMLtoDXFConverter()
+    success = converter.convert(args.input, args.output)
     
     if success:
-        if args.verbose:
-            print("Conversion completed successfully!")
+        print("Conversion completed successfully!")
         return 0
     else:
         print("Conversion failed!")
