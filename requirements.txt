@@ -4,3 +4,4 @@ geopandas
 ezdxf
 streamlit_folium
 Plotly
+fiona
