@@ -2,3 +2,4 @@ streamlit
 folium
 geopandas
 ezdxf
+streamlit_folium
