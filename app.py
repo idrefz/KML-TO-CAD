@@ -31,6 +31,25 @@ if uploaded_file:
     with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
         tmp.write(uploaded_file.getvalue())
         path = tmp.name
+# Di dalam bagian 'if uploaded_file:'
+gdf = load_all_kml_layers(path)
+
+if not gdf.empty:
+    st.sidebar.success(f"Terdeteksi {len(gdf)} objek valid.")
+    
+    # Tombol untuk memicu pembuatan file DXF
+    if st.sidebar.button("💾 Proses ke DXF"):
+        dxf_path = convert_kml_to_dxf(gdf) # Fungsi konversi Anda
+        
+        with open(dxf_path, "rb") as file:
+            st.sidebar.download_button(
+                label="📥 Klik untuk Download DXF",
+                data=file,
+                file_name="hasil_konversi.dxf",
+                mime="application/dxf"
+            )
+else:
+    st.sidebar.error("Gagal mengekstrak data Point atau LineString dari KML ini.")
 
     try:
         # Menggunakan fungsi pembacaan mendalam
