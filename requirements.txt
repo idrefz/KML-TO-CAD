@@ -1,1 +1,2 @@
+streamlit
 ezdxf>=1.0.0
