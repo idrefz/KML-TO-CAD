@@ -7,8 +7,11 @@ import plotly.graph_objects as go
 from streamlit_folium import folium_static
 import tempfile
 import os
+from shapely.geometry import Point, LineString
 
 st.set_page_config(page_title="KML to CAD Fix", layout="wide")
+
+# --- FUNGSI HELPER ---
 
 def load_kml_properly(path):
     """Membaca semua layer/folder di KML secara paksa."""
@@ -21,7 +24,29 @@ def load_kml_properly(path):
                 gdfs.append(tmp_gdf)
         except:
             continue
-    return gpd.pd.concat(gdfs, ignore_index=True) if gdfs else gpd.GeoDataFrame()
+    if gdfs:
+        full_gdf = gpd.pd.concat(gdfs, ignore_index=True)
+        # Filter hanya Point dan LineString
+        return full_gdf[full_gdf.geometry.type.isin(['Point', 'LineString'])]
+    return gpd.GeoDataFrame()
+
+def convert_kml_to_dxf(gdf):
+    """Fungsi untuk mengonversi GeoDataFrame ke file DXF sementara."""
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+    
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom.geom_type == 'Point':
+            msp.add_circle((geom.x, geom.y), radius=0.00003)
+        elif geom.geom_type == 'LineString':
+            msp.add_lwpolyline(list(geom.coords))
+            
+    tmp_dxf = tempfile.NamedTemporaryFile(delete=False, suffix='.dxf')
+    doc.saveas(tmp_dxf.name)
+    return tmp_dxf.name
+
+# --- UI UTAMA ---
 
 st.title("📐 KML to DXF (Fix Deep Folders)")
 
@@ -31,38 +56,33 @@ if uploaded_file:
     with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
         tmp.write(uploaded_file.getvalue())
         path = tmp.name
-# Di dalam bagian 'if uploaded_file:'
-gdf = load_all_kml_layers(path)
-
-if not gdf.empty:
-    st.sidebar.success(f"Terdeteksi {len(gdf)} objek valid.")
-    
-    # Tombol untuk memicu pembuatan file DXF
-    if st.sidebar.button("💾 Proses ke DXF"):
-        dxf_path = convert_kml_to_dxf(gdf) # Fungsi konversi Anda
-        
-        with open(dxf_path, "rb") as file:
-            st.sidebar.download_button(
-                label="📥 Klik untuk Download DXF",
-                data=file,
-                file_name="hasil_konversi.dxf",
-                mime="application/dxf"
-            )
-else:
-    st.sidebar.error("Gagal mengekstrak data Point atau LineString dari KML ini.")
 
     try:
-        # Menggunakan fungsi pembacaan mendalam
-        gdf_raw = load_kml_properly(path)
-        
-        # Filter: Hanya Point dan LineString (Abaikan Polygon)
-        gdf = gdf_raw[gdf_raw.geometry.type.isin(['Point', 'LineString'])].copy()
+        # 1. Ambil data
+        gdf = load_kml_properly(path)
 
         if gdf.empty:
-            st.error("Data tetap tidak terbaca. Pastikan KML bukan file kosong.")
+            st.sidebar.error("Gagal mengekstrak data dari KML ini.")
+            st.error("Data tidak ditemukan atau tidak valid.")
         else:
-            st.success(f"Berhasil membaca {len(gdf)} objek (Point & LineString).")
+            # 2. Tampilkan Info & Tombol Download di Sidebar
+            st.sidebar.success(f"Terdeteksi {len(gdf)} objek valid.")
             
+            # Buat file DXF saat tombol ditekan
+            if st.sidebar.button("💾 Proses ke DXF"):
+                dxf_path = convert_kml_to_dxf(gdf)
+                with open(dxf_path, "rb") as file:
+                    st.sidebar.download_button(
+                        label="📥 Klik untuk Download DXF",
+                        data=file,
+                        file_name="hasil_konversi.dxf",
+                        mime="application/dxf"
+                    )
+                # Opsional: Hapus file temporary setelah diproses
+                # os.unlink(dxf_path)
+
+            # 3. Visualisasi Tab
+            st.success(f"Berhasil membaca {len(gdf)} objek (Point & LineString).")
             tab1, tab2 = st.tabs(["📍 Peta Lokasi", "📐 Skematik Jaringan"])
             
             with tab1:
@@ -94,3 +114,7 @@ else:
 
     except Exception as e:
         st.error(f"Error sistem: {e}")
+    finally:
+        # Hapus file KML sementara
+        if os.path.exists(path):
+            os.unlink(path)
