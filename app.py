@@ -7,103 +7,106 @@ import tempfile
 import os
 from shapely.geometry import Point, LineString
 
-st.set_page_config(page_title="KML to DXF & Map Viewer", layout="wide")
+st.set_page_config(page_title="KML Map & Schematic", layout="wide")
 
-st.title("🗺️ KML to DXF Converter & Viewer")
+# Fungsi hitung jarak sederhana (pendekatan Euclidean untuk skematik)
+def get_dist(p1, p2):
+    return ((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)**0.5 * 111139 # Konversi kasar ke meter
 
 def convert_kml_to_dxf(gdf):
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
-    
-    # Layer Setup
-    doc.layers.new(name='GARIS_JARINGAN', dxfattribs={'color': 3}) # Hijau
-    doc.layers.new(name='NODE_TITIK', dxfattribs={'color': 1})    # Merah
-    doc.layers.new(name='LABEL_TEKS', dxfattribs={'color': 7})    # Putih
+    doc.layers.new(name='GARIS', dxfattribs={'color': 3}) # Hijau
+    doc.layers.new(name='NODE', dxfattribs={'color': 1})  # Merah
+    doc.layers.new(name='TEXT', dxfattribs={'color': 7})  # Putih
 
     for _, row in gdf.iterrows():
         geom = row.geometry
-        name = str(row['Name']) if 'Name' in gdf.columns else ""
-
         if isinstance(geom, Point):
-            x, y = geom.x, geom.y
-            msp.add_circle((x, y), radius=0.00005, dxfattribs={'layer': 'NODE_TITIK'})
-            if name:
-                msp.add_text(name, dxfattribs={'layer': 'LABEL_TEKS', 'height': 0.0001}).set_placement((x, y))
-
+            msp.add_circle((geom.x, geom.y), radius=0.00003, dxfattribs={'layer': 'NODE'})
+            msp.add_text(str(row.get('Name', '')), dxfattribs={'layer': 'TEXT', 'height': 0.00008}).set_placement((geom.x, geom.y))
         elif isinstance(geom, LineString):
-            msp.add_lwpolyline(list(geom.coords), dxfattribs={'layer': 'GARIS_JARINGAN'})
+            msp.add_lwpolyline(list(geom.coords), dxfattribs={'layer': 'GARIS'})
+    
+    tmp_path = tempfile.mktemp(suffix='.dxf')
+    doc.saveas(tmp_path)
+    return tmp_path
 
-    temp_dxf = tempfile.NamedTemporaryFile(delete=False, suffix='.dxf')
-    doc.saveas(temp_dxf.name)
-    return temp_dxf.name
+# --- UI ---
+st.title("🌐 KML Processor: Map & Schematic View")
 
-# --- SIDEBAR UPLOAD ---
-st.sidebar.header("Upload File")
-uploaded_file = st.sidebar.file_uploader("Pilih file KML", type=['kml'])
+uploaded_file = st.sidebar.file_uploader("Upload KML", type=['kml'])
 
-if uploaded_file is not None:
-    # Simpan file sementara untuk dibaca geopandas
+if uploaded_file:
     with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
         tmp.write(uploaded_file.getvalue())
-        tmp_path = tmp.name
+        path = tmp.name
 
-    try:
-        # Load Data
-        gdf = gpd.read_file(tmp_path, driver='KML')
+    gdf = gpd.read_file(path, driver='KML')
+    
+    # Membuat Tab
+    tab1, tab2 = st.tabs(["📍 Peta Lokasi (Satelit)", "📐 Skematik Jaringan (CAD Style)"])
+
+    with tab1:
+        st.subheader("Geographic Location")
+        center = [gdf.geometry.centroid.y.mean(), gdf.geometry.centroid.x.mean()]
+        m = folium.Map(location=center, zoom_start=17, tiles=None)
         
-        # Layout kolom: Kiri Peta, Kanan Kontrol/Download
-        col1, col2 = st.columns([3, 1])
+        # Tambahkan Satelit Google
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr='Google Satelit',
+            name='Google Satellite',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # Plot data
+        for _, row in gdf.iterrows():
+            if row.geometry.geom_type == 'Point':
+                folium.CircleMarker([row.geometry.y, row.geometry.x], radius=3, color='red').add_to(m)
+            else:
+                points = [[p[1], p[0]] for p in row.geometry.coords]
+                folium.PolyLine(points, color='lime', weight=2).add_to(m)
+        
+        folium_static(m, width=1000)
 
-        with col1:
-            st.subheader("Preview Peta")
-            # Inisialisasi Map (Centering ke data)
-            center = [gdf.geometry.centroid.y.mean(), gdf.geometry.centroid.x.mean()]
-            m = folium.Map(location=center, zoom_start=15, tiles='OpenStreetMap')
-            
-            # Tambahkan Tile Satelit sebagai opsi
-            folium.TileLayer(
-                tiles = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                attr = 'Esri',
-                name = 'Satellite',
-                overlay = False,
-                control = True
-            ).add_to(m)
-            folium.LayerControl().add_to(m)
+    with tab2:
+        st.subheader("Schematic Diagram")
+        st.info("Visualisasi garis dan node sesuai struktur file Anda (Background Hitam).")
+        
+        # Membuat visualisasi skematik sederhana dengan Plotly agar interaktif
+        import plotly.graph_objects as go
+        
+        fig = go.Figure()
 
-            # Gambar Geometri ke Peta
-            for _, row in gdf.iterrows():
-                sim_geo = row.geometry
-                if isinstance(sim_geo, Point):
-                    folium.CircleMarker(
-                        location=[sim_geo.y, sim_geo.x],
-                        radius=5,
-                        color='red',
-                        fill=True,
-                        popup=row.get('Name', 'Point')
-                    ).add_to(m)
-                elif isinstance(sim_geo, LineString):
-                    points = [[p[1], p[0]] for p in sim_geo.coords]
-                    folium.PolyLine(points, color="green", weight=3, opacity=0.8).add_to(m)
+        for _, row in gdf.iterrows():
+            if isinstance(row.geometry, LineString):
+                x, y = row.geometry.xy
+                fig.add_trace(go.Scatter(x=list(x), y=list(y), mode='lines+markers', 
+                                         line=dict(color='lime', width=2),
+                                         marker=dict(color='red', size=6),
+                                         name="Jalur"))
+            elif isinstance(row.geometry, Point):
+                fig.add_trace(go.Scatter(x=[row.geometry.x], y=[row.geometry.y], mode='text+markers',
+                                         text=[row.get('Name', '')],
+                                         textposition="top center",
+                                         marker=dict(color='red', size=8),
+                                         showlegend=False))
 
-            folium_static(m, width=800)
+        fig.update_layout(
+            plot_bgcolor='black',
+            paper_bgcolor='black',
+            font_color='white',
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, scaleanchor="x", scaleratio=1),
+            margin=dict(l=0, r=0, t=0, b=0),
+            height=600
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        with col2:
-            st.subheader("Opsi Konversi")
-            if st.button("Generate DXF"):
-                dxf_path = convert_kml_to_dxf(gdf)
-                with open(dxf_path, "rb") as f:
-                    st.download_button(
-                        label="💾 Download DXF",
-                        data=f,
-                        file_name=uploaded_file.name.replace(".kml", ".dxf"),
-                        mime="application/dxf"
-                    )
-                os.unlink(dxf_path)
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-else:
-    st.info("Silakan upload file KML melalui sidebar untuk melihat preview.")
+    # Download Button di Sidebar
+    if st.sidebar.button("Generate & Download DXF"):
+        dxf_file = convert_kml_to_dxf(gdf)
+        with open(dxf_file, "rb") as f:
+            st.sidebar.download_button("Click to Save DXF", f, file_name="output.dxf")
